@@ -60,11 +60,17 @@ DAY_HR_VALID_MIN_BPM = 35.0
 DAY_HR_VALID_MAX_BPM = 220.0
 
 TARGET_SLEEP_MIN = 480.0
-REST_RATIO_LOW = 0.20
-REST_RATIO_HIGH = 0.45
+DEEP_TARGET_MIN = 100.0
+REM_TARGET_MIN = 110.0
 
-W_SLEEP_SUFF = 0.70
-W_SLEEP_REST = 0.30
+W_SLEEP_SUFF = 0.45
+W_SLEEP_REST = 0.25
+W_SLEEP_CONT = 0.10
+W_REST_DEEP = 0.5
+
+SLEEP_SHAPE_ANCHOR = 90.0
+SLEEP_SHAPE_P = 1.3
+SLEEP_SHAPE_K = 3.0
 
 HRV_LOW = [25.0, 22.0, 18.0, 15.0, 12.0]
 HRV_HIGH = [80.0, 70.0, 60.0, 50.0, 45.0]
@@ -80,6 +86,8 @@ LOW_INTENSITY_HRR_THRESHOLD = 0.30
 TRIMP_A = 0.64
 TRIMP_B = 1.92
 STRAIN_TAU = 100.0
+WALK_CADENCE_MIN_SPM = 40.0
+WALK_CADENCE_MAX_SPM = 250.0
 
 
 # =========================
@@ -138,6 +146,22 @@ def _sleep_level(score: int) -> str:
     if score <= 79:
         return "fair"
     return "good"
+
+
+def _sleep_shaped(value: float, target: float) -> float:
+    """Map a sleep quantity to 0-100 against a target that anchors the 90 point.
+
+    Convex penalty below target (deficits hurt more than linearly) and a
+    saturating approach to 100 above it, so full marks are hard to reach.
+    """
+    if value <= 0.0 or target <= 0.0:
+        return 0.0
+    r = value / target
+    if r < 1.0:
+        s = SLEEP_SHAPE_ANCHOR * (r ** SLEEP_SHAPE_P)
+    else:
+        s = SLEEP_SHAPE_ANCHOR + (100.0 - SLEEP_SHAPE_ANCHOR) * (1.0 - math.exp(-SLEEP_SHAPE_K * (r - 1.0)))
+    return _clamp_float(s, 0.0, 100.0)
 
 
 def _recovery_level(score: int) -> str:
@@ -226,6 +250,8 @@ class DailyScoreInput:
     hrv_valid: Optional[bool] = None
     rhr_valid: Optional[bool] = None
     day_hr_coverage: Optional[float] = None
+    day_step_minute_count: Optional[Sequence[Optional[float]]] = None
+    waso_min: Optional[float] = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DailyScoreInput":
@@ -241,6 +267,14 @@ class DailyScoreInput:
         normalized_day_hr: List[Optional[float]] = []
         for item in day_hr_values:
             normalized_day_hr.append(_ensure_number(item))
+
+        day_step_values = data.get("day_step_minute_count")
+        if isinstance(day_step_values, Sequence) and not isinstance(day_step_values, (str, bytes)):
+            normalized_day_step: Optional[List[Optional[float]]] = [
+                _ensure_number(item) for item in day_step_values
+            ]
+        else:
+            normalized_day_step = None
 
         total_sleep_min = _ensure_number(data.get("total_sleep_min"))
         deep_sleep_min = _ensure_number(data.get("deep_sleep_min"))
@@ -266,6 +300,8 @@ class DailyScoreInput:
             hrv_valid=_normalize_bool(data.get("hrv_valid")),
             rhr_valid=_normalize_bool(data.get("rhr_valid")),
             day_hr_coverage=_ensure_number(data.get("day_hr_coverage")),
+            day_step_minute_count=normalized_day_step,
+            waso_min=_ensure_number(data.get("waso_min")),
         )
 
 
@@ -277,6 +313,9 @@ class SleepComponents:
     total_sleep_min: float
     deep_sleep_min: float
     rem_sleep_min: float
+    deep_score: Optional[float] = None
+    rem_score: Optional[float] = None
+    continuity_score: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -286,6 +325,9 @@ class SleepComponents:
             "total_sleep_min": self.total_sleep_min,
             "deep_sleep_min": self.deep_sleep_min,
             "rem_sleep_min": self.rem_sleep_min,
+            "deep_score": self.deep_score,
+            "rem_score": self.rem_score,
+            "continuity_score": self.continuity_score,
         }
 
 
@@ -409,10 +451,7 @@ def compute_sleep_performance(inp: DailyScoreInput) -> SleepPerformanceOutput:
     if inp.total_sleep_min <= 0:
         raise ValueError("total_sleep_min must be > 0")
 
-    if inp.total_sleep_min >= TARGET_SLEEP_MIN:
-        sleep_suff_score = 100.0
-    else:
-        sleep_suff_score = 100.0 * inp.total_sleep_min / TARGET_SLEEP_MIN
+    sleep_suff_score = _sleep_shaped(inp.total_sleep_min, TARGET_SLEEP_MIN)
 
     stage_usable = (
         inp.sleep_stage_valid
@@ -423,22 +462,30 @@ def compute_sleep_performance(inp: DailyScoreInput) -> SleepPerformanceOutput:
 
     restorative_ratio: Optional[float] = None
     restorative_score: Optional[float] = None
-
+    deep_score: Optional[float] = None
+    rem_score: Optional[float] = None
     if stage_usable:
         restorative_ratio = (inp.deep_sleep_min + inp.rem_sleep_min) / inp.total_sleep_min
-        if restorative_ratio <= REST_RATIO_LOW:
-            restorative_score = 0.0
-        elif restorative_ratio >= REST_RATIO_HIGH:
-            restorative_score = 100.0
-        else:
-            restorative_score = 100.0 * (restorative_ratio - REST_RATIO_LOW) / (REST_RATIO_HIGH - REST_RATIO_LOW)
+        deep_score = _sleep_shaped(inp.deep_sleep_min, DEEP_TARGET_MIN)
+        rem_score = _sleep_shaped(inp.rem_sleep_min, REM_TARGET_MIN)
+        restorative_score = W_REST_DEEP * deep_score + (1.0 - W_REST_DEEP) * rem_score
 
-        sleep_score_raw = W_SLEEP_SUFF * sleep_suff_score + W_SLEEP_REST * restorative_score
-        sleep_stage_fallback = False
-    else:
-        sleep_score_raw = sleep_suff_score
-        sleep_stage_fallback = True
+    sleep_stage_fallback = not stage_usable
+    if sleep_stage_fallback:
         warnings.append(WarningCode.SLEEP_STAGE_FALLBACK)
+
+    continuity_score: Optional[float] = None
+    waso = _ensure_number(inp.waso_min)
+    if waso is not None and waso >= 0.0:
+        continuity_score = _clamp_float(100.0 * (1.0 - waso / inp.total_sleep_min), 0.0, 100.0)
+
+    weighted = [(W_SLEEP_SUFF, sleep_suff_score)]
+    if restorative_score is not None:
+        weighted.append((W_SLEEP_REST, restorative_score))
+    if continuity_score is not None:
+        weighted.append((W_SLEEP_CONT, continuity_score))
+    weight_sum = sum(w for w, _ in weighted)
+    sleep_score_raw = sum(w * s for w, s in weighted) / weight_sum
 
     score = _clamp_int(_round_int(sleep_score_raw), 0, 100)
 
@@ -458,6 +505,9 @@ def compute_sleep_performance(inp: DailyScoreInput) -> SleepPerformanceOutput:
             total_sleep_min=inp.total_sleep_min,
             deep_sleep_min=inp.deep_sleep_min,
             rem_sleep_min=inp.rem_sleep_min,
+            deep_score=deep_score,
+            rem_score=rem_score,
+            continuity_score=continuity_score,
         ),
         warning_codes=tuple(warnings),
     )
@@ -565,7 +615,7 @@ def compute_strain(inp: DailyScoreInput) -> StrainOutput:
     trimp_day = 0.0
     valid_minutes = 0
 
-    for hr_raw in inp.day_hr_minute_bpm:
+    for idx, hr_raw in enumerate(inp.day_hr_minute_bpm):
         hr = _ensure_number(hr_raw)
         if hr is None or hr < DAY_HR_VALID_MIN_BPM or hr > DAY_HR_VALID_MAX_BPM:
             continue
@@ -590,7 +640,13 @@ def compute_strain(inp: DailyScoreInput) -> StrainOutput:
         elif 0.80 <= hrr <= 1.00:
             zone_minutes["z5"] += 1
 
-        if hrr < LOW_INTENSITY_HRR_THRESHOLD:
+        step_active = False
+        if inp.day_step_minute_count is not None and idx < len(inp.day_step_minute_count):
+            steps_m = _ensure_number(inp.day_step_minute_count[idx])
+            if steps_m is not None and WALK_CADENCE_MIN_SPM <= steps_m <= WALK_CADENCE_MAX_SPM:
+                step_active = True
+
+        if hrr < LOW_INTENSITY_HRR_THRESHOLD and not step_active:
             load_m = 0.0
         else:
             load_m = hrr * TRIMP_A * math.exp(TRIMP_B * hrr)
@@ -751,3 +807,4 @@ __all__ = [
     "compute_daily_score",
     "compute_daily_score_from_dict",
 ]
+
