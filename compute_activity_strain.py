@@ -22,7 +22,7 @@ A bounded, monotonic, saturating curve from the same family as the HR strain
 map ``21 * (1 - exp(-trimp / tau))``, so the two channels share scale behaviour
 and combine cleanly. Calibrated so that ANCHOR_STEPS -> ANCHOR_SCORE.
 
-    e.g. 4000 -> 4.0, 8000 -> 6.0 (anchor), 12000 -> 7.0, asymptote -> 8.0
+    e.g. 2000 -> 4.0, 4000 -> 6.0, 6000 -> 7.0, asymptote -> 8.0
 
 Python version: 3.10+
 """
@@ -34,12 +34,12 @@ from typing import Any, Optional
 
 # --- Calibration ---------------------------------------------------------
 ACTIVITY_CAP = 8.0          # upper bound (asymptote) of the activity channel
-ANCHOR_STEPS = 8000.0       # calibration anchor: this many gated steps ...
+ANCHOR_STEPS = 4000.0       # calibration anchor: this many gated steps ...
 ANCHOR_SCORE = 6.0          # ... maps to this activity-strain score
 
 # Time constant derived so that ANCHOR_STEPS maps to ANCHOR_SCORE exactly.
 # Solve ANCHOR_SCORE = ACTIVITY_CAP * (1 - exp(-ANCHOR_STEPS / TAU_STEP)) for TAU_STEP.
-TAU_STEP = -ANCHOR_STEPS / math.log(1.0 - ANCHOR_SCORE / ACTIVITY_CAP)  # ~= 5770.78
+TAU_STEP = -ANCHOR_STEPS / math.log(1.0 - ANCHOR_SCORE / ACTIVITY_CAP)  # ~= 2885.39
 
 
 def _ensure_number(value: Any) -> Optional[float]:
